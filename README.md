@@ -1,396 +1,726 @@
-# SENTINEL AIOps Load Balancer
+# Sentinel AIOps Load Balancer
 
-A horizontally scalable FastAPI-based AIOps orchestrator that dynamically load balances compute tasks across 1000+ C++ inference nodes with intelligent routing, circuit breaking, and real-time telemetry monitoring.
+**Version 2.2** — Thermal-aware orchestration with cooling-off routing, chaos testing, and self-healing recovery.
 
-## Project Overview
+Sentinel is an AIOps load-balancing platform that distributes inference jobs across a cluster of C++ worker nodes. Unlike basic round-robin or CPU-only balancers, it watches **die temperature**, **inference latency (p99)**, and **error rates**, then throttles traffic to stressed nodes before they crash.
 
-SENTINEL AIOPS v2.0 is a production-grade load balancing system featuring:
+---
 
-### Core Features
+## Table of contents
 
-1. **Horizontally Scalable FastAPI Orchestrator**
-   - Dynamic node registration and discovery
-   - Support for 1000+ inference nodes
-   - Non-blocking async/await architecture
-   - JSON-based node registry with persistence
+- [What problem does it solve?](#what-problem-does-it-solve)
+- [How it works](#how-it-works)
+- [Architecture](#architecture)
+- [Features](#features)
+- [Tech stack](#tech-stack)
+- [Project structure](#project-structure)
+- [Quick start (local)](#quick-start-local)
+- [Deployment modes: Docker vs Native](#deployment-modes-docker-vs-native)
+- [Production deployment](#production-deployment)
+- [Free deployment options](#free-deployment-options)
+- [Dashboard guide](#dashboard-guide)
+- [API reference](#api-reference)
+- [Configuration](#configuration)
+- [Node recovery](#node-recovery)
+- [Chaos engineering lab](#chaos-engineering-lab)
+- [Scaling](#scaling)
+- [Troubleshooting](#troubleshooting)
+- [License](#license)
 
-2. **Active Telemetry Polling (3-second interval)**
-   - Continuously polls all registered nodes every 3 seconds
-   - Captures CPU, RAM, and timestamp metrics
-   - Persists data to SQLite for historical analysis
+---
 
-3. **Least Load Routing Algorithm**
-   - Intelligently routes jobs to the node with minimum CPU utilization
-   - Ensures even distribution across the cluster
-   - Fallback to queuing when all nodes are overloaded
+## What problem does it solve?
 
-4. **Automated Circuit Breaking**
-   - Triggers when node CPU exceeds 85% threshold
-   - Isolates overloaded nodes from receiving new tasks
-   - Auto-recovery cooldown of 10 seconds
-   - Prevents cascading failures and timeouts
+Standard load balancers react after a node is already failing — high CPU, timeouts, or a hard crash. Sentinel takes a proactive approach:
 
-5. **Real-time React Dashboard**
-   - Live visualization of routing decisions
-   - 5 days of historical time-series data
-   - Per-node CPU/RAM charts with area graphs
-   - Cluster statistics and health overview
-   - Traffic router log showing live decisions
+- **Die temperature** above 75°C → routing weight drops immediately
+- **p99 inference latency** degrades vs an adaptive baseline → traffic reduced
+- **Error rate** above 12% → cooling-off period starts
+- **CPU above 85%** → circuit breaker isolates the node
+- **Failed job delivery** → automatic reroute to another node (up to 3 attempts)
+
+The goal is graceful degradation: pull traffic away early, self-heal when possible, and keep the cluster serving work.
+
+---
+
+## How it works
+
+### End-to-end flow
+
+1. Worker nodes start and **auto-register** with the orchestrator
+2. Every **3 seconds**, the orchestrator polls `GET /health` on each node
+3. Telemetry (CPU, RAM, temperature, p99 latency, error rate) is stored in **SQLite**
+4. The **CoolingOffManager** updates each node's routing weight (5% – 100%)
+5. Jobs arrive via `POST /api/submit-job` → orchestrator picks a node using **weighted random selection**
+6. Job forwarded to the node's `POST /submit-task`
+7. On delivery failure → circuit breaker opens → up to 2 more nodes tried
+8. React dashboard polls `/api/cluster-health` every 3 seconds
+
+### Worker node internals
+
+Each worker container runs two processes:
+
+| Process | Port | Role |
+|---------|------|------|
+| **C++ monitor** (`monitor.cpp`) | 8080 | Simulates CPU, RAM, die temperature; reads inference stats from shared file |
+| **Python receiver** (`receiver.py`) | 8081 | HTTP API for orchestrator: `/health`, `/submit-task`, `/chaos` |
+
+The receiver auto-registers at `http://sentinel_orchestrator:8000/api/nodes/register` on startup.
+
+### Routing algorithm (v2.2)
+
+```
+selection_weight = routing_weight × max(0.1, 1 - cpu/100)
+```
+
+- `routing_weight` set by CoolingOffManager (thermal, latency, errors)
+- Lower CPU increases selection chance
+- Minimum 5% traffic even when cooling off (unless circuit is open)
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                  React Dashboard (Port 5173)            │
-│            ├─ Live Cluster Metrics                     │
-│            ├─ Node Health Visualization               │
-│            ├─ 5-Day Historical Charts                 │
-│            └─ Routing Decision Timeline               │
-└───────────────────────────┬─────────────────────────────┘
-                            │
-                            │ HTTP (3s polling)
-                            ↓
-┌─────────────────────────────────────────────────────────┐
-│      FastAPI Orchestrator (Port 8000)                   │
-│  ├─ Telemetry Collector (3s interval polling)          │
-│  ├─ Circuit Breaker Manager                            │
-│  ├─ Least Load Router                                  │
-│  ├─ SQLite Time-Series DB (5-day retention)            │
-│  └─ Node Registry (JSON persistence)                   │
-└─────────────────┬──────────────────────────────────────┘
-                  │
-          ┌───────┴────────┐
-          │                │
-    [Node 1-4]        [Node N-1000+]
-          │                │
-    ┌─────▼─────┐    ┌─────▼─────┐
-    │ C++ Monitor   │    │ C++ Monitor   │
-    │ (Port 8080)   │    │ (Port 8080)   │
-    ├─ Hardware Metrics
-    ├─ CPU/RAM Sampling
-    └─ Load Simulation   └─────────────┘
-          │
-    ┌─────▼──────────┐
-    │ Python Receiver│
-    │ (Port 8081)    │
-    ├─ Health Check Endpoint
-    ├─ Job Submission Handler
-    └─ CORS Support
+┌──────────────────────────────────────────────────────────────────┐
+│              React Dashboard  (:5173 dev / :80 prod)             │
+│   Live metrics · Charts · Chaos lab · Recovery · Logs            │
+└─────────────────────────────┬────────────────────────────────────┘
+                              │ HTTP (3s poll)
+                              ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                  FastAPI Orchestrator  :8000                     │
+│  Node Registry · CoolingOffManager · Circuit Breaker · SQLite    │
+└─────────────────────────────┬────────────────────────────────────┘
+                              │
+          ┌───────────────────┼───────────────────┐
+          ▼                   ▼                   ▼
+    ┌───────────┐       ┌───────────┐       ┌───────────┐
+    │  node1    │       │  node2    │  ...  │  node4    │
+    │ C++ :8080 │       │ C++ :8080 │       │ C++ :8080 │
+    │ Py  :8081 │       │ Py  :8081 │       │ Py  :8081 │
+    └───────────┘       └───────────┘       └───────────┘
 ```
+
+**Production:** nginx serves the dashboard on port 80 and proxies `/api/*` to the orchestrator.
 
 ---
 
-## 📂 File Structure
+## Features
+
+### Core load balancing
+
+- Dynamic node registration (JSON registry, persisted)
+- Weighted routing (CPU + thermal/latency/error signals)
+- Job rerouting on failure (up to 3 attempts)
+- Job queuing when all nodes reject work
+- Designed to scale to **1000+ nodes** via async concurrent polling
+
+### Thermal-aware cooling-off
+
+- Die temperature from C++ workers (simulated, rises with load)
+- Threshold: **75°C** → weight drops to ~25%
+- **30-second cooling-off** after a trigger, even if metrics recover
+- Gradual weight restoration when healthy
+
+### Latency and error telemetry
+
+- Rolling window of last 100 inference samples per node
+- **p99 latency** vs adaptive per-node baseline
+- **Error rate** from failed health checks and rejected jobs
+
+### Circuit breaking
+
+- Opens at **85% CPU**
+- **10-second cooldown** before re-entry
+- Open circuits excluded from routing
+
+### Self-healing and recovery
+
+- Automatic logging: offline, recovered, circuit open/closed, traffic throttled
+- **Recover node** button on each worker card
+- **Recover all** in chaos lab
+- Detailed failure messages when recovery fails (container down, timeout, health rejected)
+- Error messages auto-clear when node returns Online
+
+### Chaos engineering lab
+
+| Action | Effect |
+|--------|--------|
+| Spike latency | Health checks slow; node may appear offline |
+| Drop packets | Random health probe failures |
+| Overload CPU | Forces CPU past circuit breaker |
+| Spike temperature | Pushes temp past thermal threshold |
+| Kill node | Worker stops responding to health/jobs |
+
+Chaos auto-expires after 45 seconds. Built-in traffic generator sends jobs every 2 seconds.
+
+### Dashboard
+
+- HUD-style UI (glass panels, animated background)
+- Cluster stats: online, avg CPU, open circuits, cooling off, chaos count
+- Per-node cards: CPU / RAM / temp, routing weight bar, status chips
+- **Multi-metric charts** — CPU, RAM, temp individually, in pairs, or all three (default: all three)
+- Self-healing log, inference delivery log, router status
+- Live / 24h / 2d / 5d history windows
+
+### Persistence
+
+- **SQLite:** `orchestrator/sentinel_metrics.db`
+- Tables: `metrics`, `routing_log`, `healing_log`, `inference_log`, `chaos_log`
+- Node registry: `orchestrator/node_registry.json`
+
+### API docs (Swagger)
+
+- Auto-generated at `/docs` — try endpoints without the dashboard
+
+---
+
+## Tech stack
+
+| Layer | Technologies |
+|-------|-------------|
+| **Orchestrator** | Python 3.11, FastAPI, Uvicorn, httpx, asyncio, SQLite |
+| **Workers** | C++11 (`monitor.cpp`), Python 3 (`receiver.py`, `chaos_state.py`) |
+| **Dashboard** | React 18, TypeScript, Vite, Tailwind CSS, Recharts, Framer Motion, Lucide |
+| **Production** | nginx (static dashboard + API proxy) |
+| **Infrastructure** | Docker, Docker Compose, Ubuntu 22.04 |
+
+---
+
+## Project structure
 
 ```
-sentinel-node/
+sentinal-node/
 ├── orchestrator/
-│   ├── master.py                    # FastAPI orchestrator (1000+ node capable)
-│   ├── Dockerfile                   # Container for orchestrator
-│   ├── requirements.txt              # Python dependencies
-│   └── node_registry.json           # Persistent node registry
+│   ├── master.py                 # FastAPI orchestrator (v2.2)
+│   ├── requirements.txt
+│   ├── Dockerfile
+│   ├── node_registry.json        # Persisted node registry
+│   └── sentinel_metrics.db       # SQLite (created at runtime)
 ├── cluster/
-│   ├── monitor.cpp                  # C++ hardware metrics agent (Linux)
-│   ├── receiver.py                  # Python API server for nodes
-│   └── Dockerfile                   # Container for inference nodes
+│   ├── monitor.cpp               # C++ hardware / thermal monitor (Docker/Linux)
+│   ├── monitor_mock.py           # Python monitor for native (no-Docker) mode
+│   ├── paths.py                  # Env-based paths and URLs
+│   ├── receiver.py               # Python worker HTTP API
+│   ├── chaos_state.py            # In-memory fault injection state
+│   └── Dockerfile
+├── scripts/
+│   ├── start-docker.ps1 / .sh    # One-command Docker stack
+│   ├── start-native.ps1 / .sh    # One-command native stack (no Docker)
+│   └── stop-native.ps1 / .sh     # Stop native processes
+├── start.ps1 / start.sh          # Launcher: docker | native | stop
 ├── dashboard/
-│   ├── src/App.tsx                 # React dashboard (Tailwind + Recharts)
-│   ├── package.json                 # Dependencies
-│   ├── Dockerfile                   # Container for dashboard
-│   ├── vite.config.ts              # Vite bundler config
-│   └── tailwind.config.js           # Tailwind CSS config
-├── docker-compose.yml               # Multi-container orchestration
-└── README.md                        # This file
+│   ├── src/
+│   │   ├── App.tsx               # Main dashboard
+│   │   ├── config.ts             # API URL (dev vs production)
+│   │   ├── index.css             # Global / HUD styles
+│   │   └── components/
+│   │       ├── ChaosPanel.tsx
+│   │       └── NodeMetricsChart.tsx
+│   ├── Dockerfile                # Dev (Vite)
+│   ├── Dockerfile.prod           # Production (nginx)
+│   ├── nginx.conf                # API proxy config
+│   └── package.json
+├── docker-compose.yml            # Local development
+├── docker-compose.prod.yml       # Production deployment
+├── load-generator.py             # Standalone traffic script
+├── DOCUMENTATION.md              # Extended reference (same content, more detail)
+├── DEPLOYMENT.md                 # Extended deploy guide
+└── README.md                     # This file
 ```
 
 ---
 
-## 🔧 Installation & Setup
+## Quick start (local)
 
 ### Prerequisites
-- Docker & Docker Compose
-- Node.js 18+ (for local dashboard development)
-- Python 3.11+ (for local orchestrator development)
-- G++ compiler (for C++ compilation)
 
-### Quick Start
+| Mode | Requirements |
+|------|--------------|
+| **Docker** (recommended) | Docker + Docker Compose |
+| **Native** (no Docker) | Python 3.11+, Node.js 18+, npm |
 
-#### Option 1: Docker Compose (Recommended)
+---
 
-```bash
-# Clone the repository
-cd sentinel-node
+## Deployment modes: Docker vs Native
 
-# Start all services
-docker-compose up --build
+Both modes run the **full demo**: 4 worker nodes, orchestrator, dashboard, thermal routing, chaos lab, and node recovery.
 
-# Access services:
-# - Dashboard: http://localhost:5173
-# - Orchestrator API: http://localhost:8000
-# - API Docs: http://localhost:8000/docs
+| | **Docker mode** | **Native mode** |
+|---|-----------------|-----------------|
+| **Best for** | Production-like demo, Linux C++ workers | Quick local dev on Windows/macOS without Docker |
+| **Worker monitor** | C++ `monitor.cpp` in containers | Python `monitor_mock.py` (same API) |
+| **One command** | `.\start.ps1 docker` or `./start.sh docker` | `.\start.ps1 native` or `./start.sh native` |
+| **Dashboard** | http://localhost:5173 | http://localhost:5173 |
+| **API / Swagger** | http://localhost:8000 / `/docs` | Same |
+| **Stop** | `Ctrl+C` or `docker compose down` | `.\start.ps1 stop` or `./start.sh stop` |
+
+### Mode A — Docker (recommended)
+
+**Windows (PowerShell):**
+
+```powershell
+cd sentinal-node
+.\start.ps1 docker
 ```
 
-#### Option 2: Local Development
+**Linux / macOS:**
 
 ```bash
-# Install orchestrator dependencies
+cd sentinal-node
+chmod +x start.sh scripts/*.sh
+./start.sh docker
+```
+
+Or directly:
+
+```bash
+docker compose up --build
+```
+
+| Service | URL |
+|---------|-----|
+| Dashboard | http://localhost:5173 |
+| Orchestrator API | http://localhost:8000 |
+| Swagger docs | http://localhost:8000/docs |
+
+**Production (Docker + nginx on port 80):**
+
+```powershell
+.\start.ps1 docker -Prod
+# or: ./start.sh docker --prod
+```
+
+**Stop:**
+
+```bash
+docker compose down
+```
+
+### Mode B — Native (no Docker)
+
+Runs orchestrator, 4 workers, and the Vite dashboard directly on your machine. Uses `monitor_mock.py` instead of C++ so it works on **Windows** without compiling.
+
+**Windows (PowerShell):**
+
+```powershell
+cd sentinal-node
+.\start.ps1 native
+```
+
+**Linux / macOS:**
+
+```bash
+./start.sh native
+```
+
+Native workers use separate ports on `127.0.0.1`:
+
+| Node | Monitor | API |
+|------|---------|-----|
+| node1 | 8080 | 8081 |
+| node2 | 8082 | 8083 |
+| node3 | 8084 | 8085 |
+| node4 | 8086 | 8087 |
+
+Worker data and chaos flags live under `runtime/native/nodeN/` (gitignored).
+
+**Stop:**
+
+```powershell
+.\start.ps1 stop
+# or: ./scripts/stop-native.ps1
+```
+
+### Verify (either mode)
+
+```bash
+curl http://localhost:8000/api/cluster-health
+
+curl -X POST http://localhost:8000/api/submit-job \
+  -H "Content-Type: application/json" \
+  -d '{"job_id": "test_1", "task_type": "inference"}'
+```
+
+Open http://localhost:5173 — you should see 4 nodes, live metrics charts, the chaos lab, and recovery buttons.
+
+### Manual native dev (orchestrator + dashboard only)
+
+If you only want the API and UI without workers:
+
+```bash
+# Terminal 1 — orchestrator
 cd orchestrator
 pip install -r requirements.txt
-python -m uvicorn master:app --reload
+python -m uvicorn master:app --reload --host 0.0.0.0 --port 8000
 
-# In another terminal, start the dashboard
+# Terminal 2 — dashboard
 cd dashboard
 npm install
 npm run dev
 ```
 
+Use `.\start.ps1 native` for the full 4-node cluster without Docker.
+
 ---
 
-## 🔌 API Endpoints
+## Production deployment
 
-### Cluster Management
+### On a VPS (Ubuntu 22.04, 2 vCPU / 4 GB RAM, port 80 open)
+
+**1. SSH into the server**
 
 ```bash
-# Get cluster health (includes all nodes' metrics)
-GET /api/cluster-health
-Response: {
-  "nodes": [...],
-  "cluster_stats": {
-    "total_nodes": 4,
-    "online_nodes": 4,
-    "avg_cpu": 35.2,
-    "critical_nodes": [],
-    "open_circuits": []
-  },
-  "log": "✅ Cluster Stable | Online: 4/4 | Avg CPU: 35.2%"
-}
+ssh ubuntu@YOUR_SERVER_IP
+```
 
-# Register a new node dynamically
-POST /api/nodes/register
-Body: { "node_id": "node_100", "url": "http://node-100:8080" }
+**2. Install Docker**
 
-# Unregister a node
+```bash
+curl -fsSL https://get.docker.com | sh
+sudo usermod -aG docker $USER
+# Log out and back in
+```
+
+**3. Copy project from your PC**
+
+```bash
+scp -r /path/to/sentinal-node ubuntu@YOUR_SERVER_IP:~/
+```
+
+Or `git clone` if the repo is on GitHub.
+
+**4. Start production stack**
+
+```bash
+cd ~/sentinal-node
+docker compose -f docker-compose.prod.yml up --build -d
+```
+
+**5. Open in browser**
+
+```
+http://YOUR_SERVER_IP/
+http://YOUR_SERVER_IP/docs
+```
+
+**6. Verify on server**
+
+```bash
+docker compose -f docker-compose.prod.yml ps
+curl http://localhost/api/cluster-health
+curl -X POST http://localhost/api/submit-job \
+  -H "Content-Type: application/json" \
+  -d '{"job_id": "deploy_test", "task_type": "inference"}'
+```
+
+### Production vs development
+
+| | Development | Production |
+|---|-------------|------------|
+| Compose file | `docker-compose.yml` | `docker-compose.prod.yml` |
+| Dashboard | Vite dev server :5173 | nginx static build :80 |
+| API access | Direct :8000 | Proxied at `/api` |
+| Orchestrator | `--reload` | 2 Uvicorn workers |
+| Restart policy | None | `unless-stopped` |
+
+### Useful production commands
+
+```bash
+docker compose -f docker-compose.prod.yml logs -f
+docker compose -f docker-compose.prod.yml restart node2
+docker compose -f docker-compose.prod.yml down
+docker compose -f docker-compose.prod.yml up --build -d   # after code changes
+```
+
+### HTTPS (optional)
+
+Put Caddy or nginx on the host in front of port 80 with your domain for TLS. See `DEPLOYMENT.md` for a Caddy example.
+
+---
+
+## Free deployment options
+
+| Option | Cost | Best for |
+|--------|------|----------|
+| **Local Docker** (`docker compose up`) | $0 | Learning, dev |
+| **Cloudflare Tunnel** from your PC | $0 | Temporary public URL while PC is on |
+| **Oracle Cloud Always Free** VM | $0 | 24/7 public server |
+| **GCP e2-micro free tier** | $0 | Small always-on (tight on RAM) |
+| **AWS / Azure free tier** | $0 first year | 12-month trial |
+
+**Oracle Always Free (recommended for $0 forever):**
+
+1. Create Ubuntu 22.04 VM at [cloud.oracle.com/free](https://www.oracle.com/cloud/free/)
+2. Open port 80 in Security List (Networking → Ingress rule)
+3. Follow [Production deployment](#production-deployment) steps above
+
+**Free on your PC with a shareable link:**
+
+```bash
+docker compose -f docker-compose.prod.yml up --build
+cloudflared tunnel --url http://localhost:80
+```
+
+---
+
+## Dashboard guide
+
+The dashboard is **one page** with several sections:
+
+| Section | Purpose |
+|---------|---------|
+| **Header + live badge** | Confirms 3-second telemetry polling |
+| **Cluster status strip** | One-line cluster summary |
+| **Stat cards** | Online nodes, avg CPU, circuits, cooling off, chaos |
+| **Chaos lab** | Inject faults, start/stop traffic, recover all |
+| **Worker node cards** | Per-node metrics, routing weight, charts, recover button |
+| **Chart metric pills** | Switch charts: CPU, RAM, temp, pairs, or all three |
+| **Self-healing log** | Automatic recovery and throttling events |
+| **Inference delivery log** | Job routing and reroutes |
+| **Router status** | Latest routing decisions |
+
+### Swagger UI (`/docs`)
+
+Separate developer page — not part of the dashboard. Use it to explore and test API endpoints manually.
+
+---
+
+## API reference
+
+### Cluster
+
+```
+GET  /api/cluster-health
+GET  /api/history/{node_id}?seconds=10
+GET  /api/history/{node_id}?days=5
+```
+
+### Nodes
+
+```
+POST   /api/nodes/register          Body: { "node_id", "url" }
 DELETE /api/nodes/{node_id}
+POST   /api/nodes/{node_id}/recover
+POST   /api/nodes/recover-all
+```
 
-# Get node telemetry history (up to 5 days)
-GET /api/history/{node_id}?days=5
-Response: [
-  { "time": "2024-01-15 10:30:45", "cpu": 42, "ram": 58 },
-  ...
-]
+### Jobs
 
-# Submit job for load balancing
+```
 POST /api/submit-job
 Body: { "job_id": "job_123", "task_type": "inference" }
-Response: {
-  "status": "Success",
-  "job_id": "job_123",
-  "assigned_node": "node_1",
-  "node_load": "35%",
-  "message": "✅ Job routed to node_1 (35% CPU) - Least Load algorithm active"
-}
+```
 
-# Get recent routing decisions
+Response includes `assigned_node`, `routing_weight`, `rerouted`, `tried_nodes`.
+
+### Chaos
+
+```
+POST /api/chaos/trigger
+Body: { "node_id", "action", "duration" }
+Actions: latency_spike | packet_drop | cpu_spike | thermal_spike | node_kill
+
+POST /api/chaos/reset
+Body: {} or { "node_id": "node1" }
+```
+
+### Logs
+
+```
 GET /api/routing-log?limit=50
-Response: [
-  {
-    "timestamp": "2024-01-15T10:35:20",
-    "job_id": "job_123",
-    "target_node": "node_1",
-    "decision_reason": "Least Load: 35% CPU"
-  },
-  ...
-]
+GET /api/healing-log?limit=40
+GET /api/inference-log?limit=30
 ```
 
----
-
-## 🎯 Key Achievements (Resume Points)
-
-### ✅ Engineered a horizontally scalable FastAPI AIOps orchestrator
-- **Implementation**: `orchestrator/master.py` uses async/await with httpx for non-blocking I/O
-- **Scalability**: Dynamic node registry (JSON) supports 1000+ nodes
-- **Performance**: Batched concurrent polling of all nodes every 3 seconds
-
-### ✅ Dynamically load balance compute tasks across 1000+ C++ inference nodes
-- **Architecture**: C++ `monitor.cpp` runs on each node, exposing HTTP endpoints
-- **Discovery**: Nodes register with orchestrator via `/api/nodes/register`
-- **Concurrency**: All nodes polled in parallel using `asyncio.gather()`
-
-### ✅ Active telemetry polling every 3 seconds
-- **Frequency**: `TELEMETRY_POLL_INTERVAL = 3` seconds
-- **Data**: CPU%, RAM%, timestamp collected from each node
-- **Persistence**: SQLite `metrics` table stores historical data
-
-### ✅ Least Load routing algorithm
-- **Algorithm**: `min(available_nodes, key=lambda nid: node_registry.nodes[nid]['metrics']['cpu'])`
-- **Routing Log**: All decisions logged to `routing_log` table with reasons
-- **Dashboard**: Real-time visualization of routing choices
-
-### ✅ Automated circuit breaking at 85% CPU threshold
-- **Threshold**: `CIRCUIT_BREAKER_THRESHOLD = 85`
-- **State Machine**: CLOSED → OPEN → CLOSED (after 10s cooldown)
-- **Effect**: Overloaded nodes isolated from receiving new tasks
-- **Prevention**: Avoids cascading failures and timeout storms
-
-### ✅ Responsive React dashboard
-- **Framework**: React 18 + Tailwind CSS + Framer Motion animations
-- **Charting**: Recharts for beautiful area charts
-- **Real-time**: Updates every 3 seconds to match telemetry interval
-- **Historical**: Displays 5 days of time-series data (user selectable)
-- **Features**:
-  - Cluster overview stats (online nodes, avg CPU, open circuits)
-  - Per-node metrics with circuit breaker status
-  - Live routing log with decision reasons
-  - System health logs
-  - Responsive grid layout for all screen sizes
-
-### ✅ SQLite time-series engine
-- **Tables**: `metrics` (telemetry) + `routing_log` (decisions)
-- **Retention**: 5 days of historical data
-- **Queries**: Efficient filtering by node_id and timestamp range
-- **Persistence**: Automatic ACID compliance
+Interactive docs: http://localhost:8000/docs (dev) or http://YOUR_IP/docs (prod)
 
 ---
 
-## ⚙️ Configuration
+## Configuration
 
-Edit `orchestrator/master.py` to customize:
+Edit constants in `orchestrator/master.py`:
 
-```python
-CIRCUIT_BREAKER_THRESHOLD = 85      # CPU percentage threshold
-CIRCUIT_BREAKER_COOLDOWN = 10       # Seconds before recovery
-TELEMETRY_POLL_INTERVAL = 3         # Seconds between health checks
-```
+| Constant | Default | Description |
+|----------|---------|-------------|
+| `CIRCUIT_BREAKER_THRESHOLD` | 85 | CPU % that opens circuit |
+| `CIRCUIT_BREAKER_COOLDOWN` | 10 | Seconds before circuit closes |
+| `TELEMETRY_POLL_INTERVAL` | 3 | Poll interval (seconds) |
+| `THERMAL_THRESHOLD_C` | 75 | Die temp (°C) for throttling |
+| `P99_LATENCY_BASELINE_MS` | 120 | Initial p99 baseline |
+| `P99_VARIANCE_FACTOR` | 1.8 | Baseline multiplier for alert |
+| `ERROR_RATE_THRESHOLD` | 0.12 | Error rate (12%) for throttling |
+| `COOLING_OFF_DURATION` | 30 | Reduced-weight period (seconds) |
+| `MIN_TRAFFIC_WEIGHT` | 0.05 | Minimum routing weight (5%) |
 
 ---
 
-## 📊 Monitoring
+## Node recovery
 
-### Real-time Dashboard
-Access http://localhost:5173 to view:
-- Live cluster health
-- Per-node CPU/RAM graphs (5-day history)
-- Routing decisions in real-time
-- System alerts and warnings
+### What Recover does
 
-### API Documentation
-Access http://localhost:8000/docs for interactive Swagger UI
+1. Clears chaos on the worker (`POST /chaos` reset)
+2. Closes circuit breaker on orchestrator
+3. Resets routing weight to 100%
+4. Re-polls health immediately
 
-### Database Inspection
+### When recovery works
+
+Chaos-driven offline states while the worker process is still running.
+
+### When recovery fails
+
+| Reason | Meaning | Fix |
+|--------|---------|-----|
+| `container_unreachable` | Worker not accepting connections | `docker compose restart nodeX` |
+| `chaos_reset_timeout` | No response in 3s | Restart container |
+| `health_timeout` | Chaos cleared but health timed out | Retry or restart |
+| `health_rejected` | Worker still returning HTTP errors | Retry Recover |
+| `node_not_found` | Not in registry | Re-register node |
+
+Failure messages appear on the node card and in the status panel. They **auto-clear** when the node returns Online.
+
+### Recover via API
 
 ```bash
-# Connect to SQLite database
-sqlite3 orchestrator/sentinel_metrics.db
-
-# View recent metrics
-SELECT node_id, cpu, ram, timestamp FROM metrics ORDER BY id DESC LIMIT 20;
-
-# View routing decisions
-SELECT timestamp, job_id, target_node, decision_reason FROM routing_log ORDER BY id DESC LIMIT 20;
-
-# Node registry
-cat orchestrator/node_registry.json | python -m json.tool
+curl -X POST http://localhost:8000/api/nodes/node1/recover
+curl -X POST http://localhost:8000/api/nodes/recover-all
 ```
 
 ---
 
-## 🧪 Testing
+## Chaos engineering lab
 
-### Simulate High Load
+1. Click **Start traffic** (jobs every 2 seconds)
+2. Select a target node
+3. Trigger a fault (e.g. **Spike temperature**)
+4. Watch routing weight drop and traffic shift within ~3 seconds
+5. Click **Recover node** or **Recover all**
+
+Chaos auto-expires after 45 seconds if not reset manually.
+
+---
+
+## Scaling
+
+Add nodes by copying a block in `docker-compose.yml` or `docker-compose.prod.yml`:
+
+```yaml
+  node5:
+    build: ./cluster
+    restart: unless-stopped
+    environment:
+      - NODE_ID=node5
+      - NODE_PORT=8081
+    networks:
+      cluster_net:
+        ipv4_address: 172.18.0.6
+```
+
 ```bash
-# Trigger stress test on a specific node
-curl -X POST http://localhost:8000/api/inject-load
+docker compose -f docker-compose.prod.yml up --build -d node5
+```
 
-# Submit multiple jobs
-for i in {1..100}; do
-  curl -X POST http://localhost:8000/api/submit-job \
+Each node auto-registers on startup. For 100+ nodes, consider Kubernetes StatefulSets.
+
+---
+
+## Troubleshooting
+
+### Dashboard loads but no data
+
+```bash
+curl http://localhost:8000/api/cluster-health   # dev
+curl http://localhost/api/cluster-health          # prod via nginx
+docker compose logs orchestrator
+```
+
+### Nodes stay Offline
+
+```bash
+docker compose restart node1 node2 node3 node4
+# Or use Recover all in dashboard
+```
+
+### `Failed to resolve import "./config"` in ChaosPanel
+
+Import must be `../config` (fixed in v2.2) — `config.ts` lives in `src/`, not `src/components/`.
+
+### Port 80 in use (production)
+
+Change dashboard ports in `docker-compose.prod.yml` to `"8080:80"`.
+
+### C++ build fails on Windows
+
+Build workers inside Docker only — `monitor.cpp` uses Linux sockets.
+
+### Reset metrics database
+
+```bash
+rm orchestrator/sentinel_metrics.db
+docker compose restart orchestrator
+```
+
+### Backup orchestrator data
+
+```bash
+docker cp sentinel_orchestrator:/app/sentinel_metrics.db ./backup/
+docker cp sentinel_orchestrator:/app/node_registry.json ./backup/
+```
+
+---
+
+## Testing
+
+```bash
+# Submit many jobs
+for i in $(seq 1 20); do
+  curl -s -X POST http://localhost:8000/api/submit-job \
     -H "Content-Type: application/json" \
     -d "{\"job_id\": \"job_$i\", \"task_type\": \"inference\"}"
 done
+
+# Or use the standalone script
+python load-generator.py
 ```
 
-### Monitor Circuit Breaker
-Watch the dashboard as nodes approach 85% CPU - circuits will open and prevent new task allocation.
+Watch the dashboard during chaos tests — routing should shift away from affected nodes within one telemetry cycle.
 
 ---
 
-## 📈 Scaling to 1000+ Nodes
+## License
 
-### Option 1: Docker Compose Generator
-```bash
-# Generate docker-compose.yml with N nodes
-python3 -c "
-services = {}
-for i in range(1, 1001):
-    services[f'node{i}'] = {
-        'build': './cluster',
-        'environment': ['NODE_PORT=8080'],
-        'networks': {'cluster_net': {'ipv4_address': f'172.18.{i//256}.{i%256}'}}
-    }
-# ... write to docker-compose.yml
-"
-```
-
-### Option 2: Kubernetes Deployment
-Scale nodes using Kubernetes StatefulSet:
-```yaml
-apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: sentinel-nodes
-spec:
-  replicas: 1000
-  serviceName: sentinel-node
-  template:
-    spec:
-      containers:
-      - name: node
-        image: sentinel-cluster:latest
-        ports:
-        - containerPort: 8080
-```
+Proprietary — Sentinel AIOps Project (2024–2026)
 
 ---
 
-## 🐛 Troubleshooting
+## Quick reference
 
-### Nodes not appearing in cluster
 ```bash
-# Check if nodes are running
-docker ps | grep sentinel
+# Local dev
+docker compose up --build
 
-# Manually register a node
-curl -X POST http://localhost:8000/api/nodes/register \
+# Production
+docker compose -f docker-compose.prod.yml up --build -d
+
+# Dashboard (dev)     http://localhost:5173
+# Dashboard (prod)    http://YOUR_SERVER_IP/
+# API docs            http://localhost:8000/docs
+
+# Health check
+curl http://localhost:8000/api/cluster-health
+
+# Submit job
+curl -X POST http://localhost:8000/api/submit-job \
   -H "Content-Type: application/json" \
-  -d '{"node_id": "node_manual", "url": "http://node:8080"}'
+  -d '{"job_id": "test", "task_type": "inference"}'
+
+# Recover node
+curl -X POST http://localhost:8000/api/nodes/node1/recover
+
+# Stop
+docker compose down
 ```
 
-### High latency in telemetry
-- Increase `TELEMETRY_POLL_INTERVAL` if network is slow
-- Check node availability with health check endpoint
-- Monitor dashboard for circuit breaker states
-
-### SQLite database locked
-```bash
-# Reset database
-rm orchestrator/sentinel_metrics.db
-```
-
----
-
-## 📝 License
-
-Proprietary - SENTINEL AIOps Project (2024-2026)
-
----
-
-## 👤 Author
-
-Built as part of the SENTINEL AIOps project for horizontally scalable load balancing.
-
----
-
-**v2.0 - Production Ready** ✅
+**Sentinel AIOps v2.2**

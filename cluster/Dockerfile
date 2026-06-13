@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y \
     net-tools
 
 WORKDIR /app
-COPY monitor.cpp receiver.py chaos_state.py ./
+COPY monitor.cpp receiver.py chaos_state.py paths.py monitor_mock.py ./
 
 # Compile C++ Hardware Monitor (Linux version with socket support)
 RUN g++ -o monitor monitor.cpp -std=c++11

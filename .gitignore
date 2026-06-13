@@ -49,6 +49,5 @@ orchestrator/node_registry.json
 load-generator.log
 .cache/
 
-# Logs
-*.log
-logs/
+# Runtime (native mode worker data + PIDs)
+runtime/

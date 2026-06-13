@@ -41,6 +41,9 @@ services:
     environment:
       - NODE_ID=node1
       - NODE_PORT=8081
+      - NODE_HOST=node1
+      - MONITOR_URL=http://127.0.0.1:8080
+      - ORCHESTRATOR_URL=http://sentinel_orchestrator:8000/api/nodes/register
     networks:
       cluster_net:
         ipv4_address: 172.18.0.2
@@ -51,6 +54,9 @@ services:
     environment:
       - NODE_ID=node2
       - NODE_PORT=8081
+      - NODE_HOST=node2
+      - MONITOR_URL=http://127.0.0.1:8080
+      - ORCHESTRATOR_URL=http://sentinel_orchestrator:8000/api/nodes/register
     networks:
       cluster_net:
         ipv4_address: 172.18.0.3
@@ -61,6 +67,9 @@ services:
     environment:
       - NODE_ID=node3
       - NODE_PORT=8081
+      - NODE_HOST=node3
+      - MONITOR_URL=http://127.0.0.1:8080
+      - ORCHESTRATOR_URL=http://sentinel_orchestrator:8000/api/nodes/register
     networks:
       cluster_net:
         ipv4_address: 172.18.0.4
@@ -71,6 +80,9 @@ services:
     environment:
       - NODE_ID=node4
       - NODE_PORT=8081
+      - NODE_HOST=node4
+      - MONITOR_URL=http://127.0.0.1:8080
+      - ORCHESTRATOR_URL=http://sentinel_orchestrator:8000/api/nodes/register
     networks:
       cluster_net:
         ipv4_address: 172.18.0.5
