@@ -1,0 +1,89 @@
+version: '3.8'
+services:
+  # FastAPI Orchestrator (Master)
+  orchestrator:
+    build:
+      context: ./orchestrator
+      dockerfile: Dockerfile
+    container_name: sentinel_orchestrator
+    ports:
+      - "8000:8000"
+    environment:
+      - PYTHONUNBUFFERED=1
+    networks:
+      cluster_net:
+        ipv4_address: 172.18.0.100
+    volumes:
+      - ./orchestrator:/app
+    command: python3 -m uvicorn master:app --host 0.0.0.0 --port 8000 --reload
+
+  # Dashboard (React + Vite)
+  dashboard:
+    build:
+      context: ./dashboard
+    container_name: sentinel_dashboard
+    ports:
+      - "5173:5173"
+    networks:
+      cluster_net:
+        ipv4_address: 172.18.0.101
+    volumes:
+      - ./dashboard:/app
+      - /app/node_modules
+    command: npm run dev -- --host 0.0.0.0
+
+  # Inference Nodes (Scalable cluster - 1000+ capable)
+  node1:
+    build: ./cluster
+    environment:
+      - NODE_ID=node1
+      - NODE_PORT=8081
+    networks:
+      cluster_net:
+        ipv4_address: 172.18.0.2
+    expose:
+      - "8080"
+      - "8081"
+
+  node2:
+    build: ./cluster
+    environment:
+      - NODE_ID=node2
+      - NODE_PORT=8081
+    networks:
+      cluster_net:
+        ipv4_address: 172.18.0.3
+    expose:
+      - "8080"
+      - "8081"
+
+  node3:
+    build: ./cluster
+    environment:
+      - NODE_ID=node3
+      - NODE_PORT=8081
+    networks:
+      cluster_net:
+        ipv4_address: 172.18.0.4
+    expose:
+      - "8080"
+      - "8081"
+
+  node4:
+    build: ./cluster
+    environment:
+      - NODE_ID=node4
+      - NODE_PORT=8081
+    networks:
+      cluster_net:
+        ipv4_address: 172.18.0.5
+    expose:
+      - "8080"
+      - "8081"
+
+networks:
+  cluster_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.18.0.0/16
