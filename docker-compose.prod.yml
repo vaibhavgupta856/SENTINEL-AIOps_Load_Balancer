@@ -1,0 +1,83 @@
+# Production deployment — build once, run without dev reload servers.
+#
+# Usage:
+#   docker compose -f docker-compose.prod.yml up --build -d
+#
+# Access:
+#   Dashboard + API (proxied): http://<your-server-ip>/
+#   Swagger docs:              http://<your-server-ip>/docs
+
+services:
+  orchestrator:
+    build:
+      context: ./orchestrator
+      dockerfile: Dockerfile
+    container_name: sentinel_orchestrator
+    restart: unless-stopped
+    environment:
+      - PYTHONUNBUFFERED=1
+    networks:
+      cluster_net:
+        ipv4_address: 172.18.0.100
+    command: python3 -m uvicorn master:app --host 0.0.0.0 --port 8000 --workers 2
+
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile.prod
+    container_name: sentinel_dashboard
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    depends_on:
+      - orchestrator
+    networks:
+      cluster_net:
+        ipv4_address: 172.18.0.101
+
+  node1:
+    build: ./cluster
+    restart: unless-stopped
+    environment:
+      - NODE_ID=node1
+      - NODE_PORT=8081
+    networks:
+      cluster_net:
+        ipv4_address: 172.18.0.2
+
+  node2:
+    build: ./cluster
+    restart: unless-stopped
+    environment:
+      - NODE_ID=node2
+      - NODE_PORT=8081
+    networks:
+      cluster_net:
+        ipv4_address: 172.18.0.3
+
+  node3:
+    build: ./cluster
+    restart: unless-stopped
+    environment:
+      - NODE_ID=node3
+      - NODE_PORT=8081
+    networks:
+      cluster_net:
+        ipv4_address: 172.18.0.4
+
+  node4:
+    build: ./cluster
+    restart: unless-stopped
+    environment:
+      - NODE_ID=node4
+      - NODE_PORT=8081
+    networks:
+      cluster_net:
+        ipv4_address: 172.18.0.5
+
+networks:
+  cluster_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.18.0.0/16

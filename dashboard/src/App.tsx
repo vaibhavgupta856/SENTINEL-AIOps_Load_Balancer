@@ -17,10 +17,7 @@ import {
 
 import ChaosPanel from './components/ChaosPanel';
 import NodeMetricsChart, { ChartView, ChartViewSelector } from './components/NodeMetricsChart';
-
-
-
-const API = 'http://127.0.0.1:8000';
+import { API } from './config';
 
 
 

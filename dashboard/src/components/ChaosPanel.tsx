@@ -1,7 +1,6 @@
 import React, { useState } from 'react';
 import { AlertTriangle, RotateCcw, Zap, WifiOff, Timer, Skull, Thermometer, Play, Square } from 'lucide-react';
-
-const API = 'http://127.0.0.1:8000';
+import { API } from '../config';
 
 type ChaosPanelProps = {
   nodes: any[];
