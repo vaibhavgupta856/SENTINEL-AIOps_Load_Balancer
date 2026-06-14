@@ -258,20 +258,16 @@ export default function App() {
   }, [timeFilter]);
 
   useEffect(() => {
-    const onlineIds = new Set(
-      (data.nodes || [])
-        .filter((n: any) => n.status === 'Online')
-        .map((n: any) => n.node_id)
-    );
-
-    if (onlineIds.size === 0) return;
-
     setRecoveryErrors((prev) => {
       const next = { ...prev };
       let changed = false;
-      for (const nodeId of onlineIds) {
-        if (next[nodeId]) {
-          delete next[nodeId];
+      for (const node of data.nodes || []) {
+        const healthy =
+          node.status === 'Online'
+          && !node.chaos?.killed
+          && node.circuit_breaker !== 'OPEN';
+        if (healthy && next[node.node_id]) {
+          delete next[node.node_id];
           changed = true;
         }
       }
@@ -560,6 +556,10 @@ export default function App() {
 
 
               const needsRecovery = node.status === 'Offline'
+                || node.chaos?.killed
+                || (node.chaos?.active && node.chaos?.action === 'node_kill');
+
+              const showRecoverHint = needsRecovery
                 || node.circuit_breaker === 'OPEN'
                 || underChaos
                 || coolingOff;
@@ -626,7 +626,7 @@ export default function App() {
                             </span>
                           )}
                         </div>
-                        {needsRecovery && (
+                        {showRecoverHint && (
                           <button
                             type="button"
                             onClick={() => recoverNode(node.node_id)}
@@ -634,7 +634,11 @@ export default function App() {
                             className="mt-2 flex items-center gap-1.5 text-[9px] font-orbitron uppercase tracking-wider px-2.5 py-1 rounded border border-emerald-500/35 text-emerald-300 bg-emerald-500/10 hover:bg-emerald-500/20 hover:border-emerald-400/50 disabled:opacity-50 transition-all"
                           >
                             <RotateCcw size={10} className={recoveringNode === node.node_id ? 'animate-spin' : ''} />
-                            {recoveringNode === node.node_id ? 'Recovering...' : 'Recover node'}
+                            {recoveringNode === node.node_id
+                              ? 'Recovering...'
+                              : needsRecovery
+                                ? 'Recover node'
+                                : 'Clear throttling'}
                           </button>
                         )}
                         {recoveryErrors[node.node_id] && (

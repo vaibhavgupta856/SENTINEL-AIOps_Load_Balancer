@@ -18,6 +18,8 @@ if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
     exit 1
 }
 
+& (Join-Path $Root "scripts\stop-native.ps1")
+
 if ($Prod) {
     Write-Host "Starting production stack (nginx :80, 2 orchestrator workers)..." -ForegroundColor Yellow
     docker compose -f docker-compose.prod.yml up --build -d

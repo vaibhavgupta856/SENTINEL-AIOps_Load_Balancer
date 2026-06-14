@@ -24,6 +24,59 @@ MIN_TRAFFIC_WEIGHT = 0.05
 
 CHAOS_ACTIONS = {"latency_spike", "packet_drop", "cpu_spike", "thermal_spike", "node_kill"}
 
+IN_DOCKER = os.path.exists("/.dockerenv")
+
+def is_localhost_url(url: str) -> bool:
+    return "127.0.0.1" in url or "localhost" in url.lower()
+
+def docker_worker_url(node_id: str) -> str:
+    return f"http://{node_id}:8081"
+
+def resolve_worker_url(node_id: str, registry=None) -> str:
+    """Ensure worker URL points at the receiver API, especially inside Docker."""
+    reg = registry if registry is not None else node_registry
+    node = reg.nodes.get(node_id)
+    if not node:
+        return docker_worker_url(node_id)
+
+    url = node.get("url", "")
+    fixed = url
+
+    if IN_DOCKER:
+        if is_localhost_url(url) or not url.endswith(":8081"):
+            fixed = docker_worker_url(node_id)
+    elif is_localhost_url(url):
+        native_ports = {"node1": 8081, "node2": 8083, "node3": 8085, "node4": 8087}
+        expected = native_ports.get(node_id)
+        if expected and f":{expected}" not in url:
+            fixed = f"http://127.0.0.1:{expected}"
+
+    if fixed != url:
+        logger.warning(f"Worker URL repair: {node_id} {url} -> {fixed}")
+        node["url"] = fixed
+        reg.save()
+
+    return fixed
+
+def repair_registry_urls(registry) -> None:
+    """Fix stale worker URLs (native localhost / wrong ports)."""
+    if not registry.nodes:
+        return
+    changed = False
+    for node_id in list(registry.nodes.keys()):
+        before = registry.nodes[node_id].get("url", "")
+        after = resolve_worker_url(node_id, registry)
+        if before != after:
+            changed = True
+    if changed:
+        logger.info("Registry worker URLs repaired")
+
+RECOVERY_GRACE_SECONDS = 60
+recovery_grace_until: Dict[str, float] = {}
+
+def in_recovery_grace(node_id: str) -> bool:
+    return recovery_grace_until.get(node_id, 0) > time.time()
+
 class CircuitBreaker:
     def __init__(self):
         self.state = {}
@@ -145,6 +198,17 @@ class NodeRegistry:
         self.load()
 
     def register(self, node_id: str, url: str) -> dict:
+        existing = self.nodes.get(node_id)
+        if existing and is_localhost_url(url):
+            prev_url = existing.get("url", "")
+            if prev_url and not is_localhost_url(prev_url):
+                logger.warning(
+                    f"Ignoring localhost registration for {node_id}; keeping Docker URL {prev_url}"
+                )
+                existing["registered_at"] = datetime.now().isoformat()
+                self.save()
+                return existing
+
         self.nodes[node_id] = {
             'url': url,
             'registered_at': datetime.now().isoformat(),
@@ -193,8 +257,10 @@ class NodeRegistry:
                 metrics.setdefault('inference_latency_p99_ms', 0)
                 metrics.setdefault('error_rate', 0)
                 metrics.setdefault('routing_weight', 1.0)
+            repair_registry_urls(self)
 
 node_registry = NodeRegistry()
+repair_registry_urls(node_registry)
 
 def init_db():
     conn = sqlite3.connect('sentinel_metrics.db')
@@ -445,31 +511,46 @@ async def recover_node(client: httpx.AsyncClient, node_id: str) -> dict:
             "recoverable": False,
         }
 
-    url = node["url"]
+    url = resolve_worker_url(node_id)
     chaos_cleared = False
     chaos_error = None
 
-    try:
-        resp = await client.post(f"{url}/chaos", json={"action": "reset"}, timeout=3.0)
-        if resp.status_code == 200:
-            node["chaos"] = None
-            chaos_cleared = True
-        else:
-            chaos_error = {
-                "reason": "chaos_reset_rejected",
-                "detail": f"worker returned HTTP {resp.status_code}",
-            }
-    except Exception as e:
-        chaos_error = _classify_chaos_reset_error(e)
-        logger.warning(f"Chaos reset failed for {node_id}: {e}")
+    async def reset_worker_chaos(target_url: str) -> tuple[bool, Optional[dict]]:
+        cleared = False
+        error = None
+        try:
+            resp = await client.post(f"{target_url}/chaos", json={"action": "reset"}, timeout=3.0)
+            if resp.status_code == 200:
+                node["chaos"] = None
+                cleared = True
+            else:
+                error = {
+                    "reason": "chaos_reset_rejected",
+                    "detail": f"worker returned HTTP {resp.status_code}",
+                }
+        except Exception as e:
+            error = _classify_chaos_reset_error(e)
+            logger.warning(f"Chaos reset failed for {node_id} at {target_url}: {e}")
+        return cleared, error
+
+    chaos_cleared, chaos_error = await reset_worker_chaos(url)
 
     circuit_breaker.close(node_id)
     cooling_off.reset(node_id)
+    recovery_grace_until[node_id] = time.time() + RECOVERY_GRACE_SECONDS
     if node.get("metrics"):
         node["metrics"]["routing_weight"] = 1.0
 
-    poll = await fetch_and_save(client, node_id)
-    online = poll is not None and poll.get("status") == "Online"
+    poll = None
+    online = False
+    for _ in range(4):
+        poll = await fetch_and_save(client, node_id)
+        online = poll is not None and poll.get("status") == "Online"
+        if online:
+            break
+        if not chaos_cleared:
+            chaos_cleared, chaos_error = await reset_worker_chaos(url)
+        await asyncio.sleep(0.4)
 
     if online:
         return {
@@ -484,6 +565,31 @@ async def recover_node(client: httpx.AsyncClient, node_id: str) -> dict:
         }
 
     health_probe = await probe_worker_health(client, url)
+
+    if IN_DOCKER and (is_localhost_url(url) or health_probe.get("reason") in {
+        "container_unreachable", "health_rejected"
+    }):
+        url = resolve_worker_url(node_id)
+        chaos_cleared, chaos_error = await reset_worker_chaos(url)
+        for _ in range(4):
+            poll = await fetch_and_save(client, node_id)
+            online = poll is not None and poll.get("status") == "Online"
+            if online:
+                return {
+                    "node_id": node_id,
+                    "ok": True,
+                    "status": "Online",
+                    "chaos_cleared": chaos_cleared,
+                    "circuit": "CLOSED",
+                    "routing_weight": 1.0,
+                    "message": (
+                        f"{node_id} is back online. Fixed worker URL and cleared kill/chaos state."
+                    ),
+                    "recoverable": True,
+                }
+            await asyncio.sleep(0.4)
+        health_probe = await probe_worker_health(client, url)
+
     failure_reason, message = build_recovery_failure_message(
         node_id, url, chaos_cleared, chaos_error, health_probe
     )
@@ -512,8 +618,16 @@ async def fetch_and_save(client, node_id: str):
     if not node:
         return None
 
+    url = resolve_worker_url(node_id)
+
     try:
-        resp = await client.get(f"{node['url']}/health", timeout=2.0)
+        resp = await client.get(f"{url}/health", timeout=2.0)
+        if resp.status_code == 503:
+            try:
+                await client.post(f"{url}/chaos", json={"action": "reset"}, timeout=2.0)
+                resp = await client.get(f"{url}/health", timeout=2.0)
+            except Exception:
+                pass
         if resp.status_code != 200:
             raise httpx.HTTPStatusError("unhealthy", request=resp.request, response=resp)
 
@@ -526,12 +640,16 @@ async def fetch_and_save(client, node_id: str):
             'error_rate': data.get('error_rate', 0),
         }
         routing_weight = cooling_off.update(node_id, metrics)
+        if in_recovery_grace(node_id):
+            routing_weight = 1.0
+            cooling_off.weights[node_id] = 1.0
+            cooling_off.last_reason[node_id] = "healthy (recovery grace)"
         metrics['routing_weight'] = routing_weight
         node['metrics'] = metrics
         node['status'] = 'Online'
         node['last_heartbeat'] = datetime.now().isoformat()
 
-        if data['cpu'] >= CIRCUIT_BREAKER_THRESHOLD:
+        if data['cpu'] >= CIRCUIT_BREAKER_THRESHOLD and not in_recovery_grace(node_id):
             circuit_breaker.open(node_id)
         else:
             circuit_breaker.close(node_id)
@@ -561,7 +679,7 @@ async def fetch_and_save(client, node_id: str):
         track_state_transition(node_id, 'Online', circuit)
 
         try:
-            chaos_resp = await client.get(f"{node['url']}/chaos/status", timeout=1.0)
+            chaos_resp = await client.get(f"{url}/chaos/status", timeout=1.0)
             if chaos_resp.status_code == 200:
                 node['chaos'] = chaos_resp.json()
         except Exception:
@@ -569,7 +687,7 @@ async def fetch_and_save(client, node_id: str):
 
         return {
             'node_id': node_id,
-            'url': node['url'],
+            'url': url,
             'cpu': data['cpu'],
             'ram': data['ram'],
             'temperature_c': metrics['temperature_c'],
@@ -779,6 +897,8 @@ async def trigger_chaos(req: Request):
     if not node:
         raise HTTPException(status_code=404, detail="Node not found")
 
+    url = resolve_worker_url(node_id)
+
     payload = {
         "action": action,
         "duration": duration,
@@ -788,7 +908,7 @@ async def trigger_chaos(req: Request):
 
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.post(f"{node['url']}/chaos", json=payload, timeout=3.0)
+            resp = await client.post(f"{url}/chaos", json=payload, timeout=3.0)
             resp.raise_for_status()
             chaos_state = resp.json()
         except Exception as e:
@@ -835,6 +955,8 @@ async def reset_chaos(req: Request):
         }
 
     async with httpx.AsyncClient() as client:
+        for nid in list(node_registry.nodes.keys()):
+            resolve_worker_url(nid)
         results = []
         for nid in list(node_registry.nodes.keys()):
             results.append(await recover_node(client, nid))
