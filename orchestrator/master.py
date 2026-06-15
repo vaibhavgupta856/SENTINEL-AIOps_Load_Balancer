@@ -132,7 +132,18 @@ class CoolingOffManager:
         temp_c = metrics.get('temperature_c', 0)
         p99_ms = metrics.get('inference_latency_p99_ms', 0)
         error_rate = metrics.get('error_rate', 0)
+        cpu_pct = metrics.get('cpu', 0)
         baseline = self._adaptive_baseline(node_id, p99_ms)
+
+        if cpu_pct >= CIRCUIT_BREAKER_THRESHOLD:
+            weight = min(weight, MIN_TRAFFIC_WEIGHT)
+            reasons.append(f"cpu {cpu_pct}%")
+            self.cooling_until[node_id] = time.time() + COOLING_OFF_DURATION
+        elif cpu_pct >= 65:
+            severity = min(1.0, (cpu_pct - 65) / max(1, CIRCUIT_BREAKER_THRESHOLD - 65))
+            weight = min(weight, max(MIN_TRAFFIC_WEIGHT, 0.75 - (severity * 0.55)))
+            reasons.append(f"cpu {cpu_pct}%")
+            self.cooling_until[node_id] = time.time() + COOLING_OFF_DURATION
 
         if temp_c >= THERMAL_THRESHOLD_C:
             weight = min(weight, 0.25)
@@ -432,7 +443,7 @@ def _classify_chaos_reset_error(exc: Exception) -> dict:
     if isinstance(exc, httpx.TimeoutException):
         return {
             "reason": "chaos_reset_timeout",
-            "detail": "chaos reset timed out after 3 seconds — worker may be hung",
+            "detail": "chaos reset timed out after 8 seconds — worker may be hung",
         }
     if isinstance(exc, httpx.ConnectError):
         return {
@@ -518,19 +529,28 @@ async def recover_node(client: httpx.AsyncClient, node_id: str) -> dict:
     async def reset_worker_chaos(target_url: str) -> tuple[bool, Optional[dict]]:
         cleared = False
         error = None
-        try:
-            resp = await client.post(f"{target_url}/chaos", json={"action": "reset"}, timeout=3.0)
-            if resp.status_code == 200:
-                node["chaos"] = None
-                cleared = True
-            else:
-                error = {
-                    "reason": "chaos_reset_rejected",
-                    "detail": f"worker returned HTTP {resp.status_code}",
-                }
-        except Exception as e:
-            error = _classify_chaos_reset_error(e)
-            logger.warning(f"Chaos reset failed for {node_id} at {target_url}: {e}")
+        for reset_path in ("/chaos/reset", "/chaos"):
+            try:
+                if reset_path == "/chaos/reset":
+                    resp = await client.post(f"{target_url}{reset_path}", timeout=8.0)
+                else:
+                    resp = await client.post(
+                        f"{target_url}{reset_path}",
+                        json={"action": "reset"},
+                        timeout=8.0,
+                    )
+                if resp.status_code == 200:
+                    node["chaos"] = None
+                    cleared = True
+                    break
+                if reset_path == "/chaos":
+                    error = {
+                        "reason": "chaos_reset_rejected",
+                        "detail": f"worker returned HTTP {resp.status_code}",
+                    }
+            except Exception as e:
+                error = _classify_chaos_reset_error(e)
+                logger.warning(f"Chaos reset failed for {node_id} at {target_url}{reset_path}: {e}")
         return cleared, error
 
     chaos_cleared, chaos_error = await reset_worker_chaos(url)
@@ -622,12 +642,6 @@ async def fetch_and_save(client, node_id: str):
 
     try:
         resp = await client.get(f"{url}/health", timeout=2.0)
-        if resp.status_code == 503:
-            try:
-                await client.post(f"{url}/chaos", json={"action": "reset"}, timeout=2.0)
-                resp = await client.get(f"{url}/health", timeout=2.0)
-            except Exception:
-                pass
         if resp.status_code != 200:
             raise httpx.HTTPStatusError("unhealthy", request=resp.request, response=resp)
 

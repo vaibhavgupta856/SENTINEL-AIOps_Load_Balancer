@@ -18,17 +18,25 @@ if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
     exit 1
 }
 
-& (Join-Path $Root "scripts\stop-native.ps1")
+& (Join-Path $Root "scripts\cleanup-sentinel.ps1")
 
 if ($Prod) {
-    Write-Host "Starting production stack (nginx :80, 2 orchestrator workers)..." -ForegroundColor Yellow
+    Write-Host "Starting production stack (nginx :80)..." -ForegroundColor Yellow
     docker compose -f docker-compose.prod.yml up --build -d
     Write-Host ""
     Write-Host "Dashboard : http://localhost" -ForegroundColor Green
     Write-Host "API docs  : http://localhost/docs" -ForegroundColor Green
-    Write-Host ""
     Write-Host "Stop: docker compose -f docker-compose.prod.yml down" -ForegroundColor DarkGray
 } else {
-    Write-Host "Starting development stack (Vite :5173, API :8000, 4 worker nodes)..." -ForegroundColor Yellow
-    docker compose up --build
+    Write-Host "Starting development stack (detached)..." -ForegroundColor Yellow
+    docker compose up --build -d
+    Write-Host ""
+    Write-Host "Dashboard : http://localhost:5173" -ForegroundColor Green
+    Write-Host "API       : http://localhost:8000" -ForegroundColor Green
+    Write-Host "Swagger   : http://localhost:8000/docs" -ForegroundColor Green
+    Write-Host ""
+    Write-Host "Wait ~30s for all 4 nodes to register." -ForegroundColor DarkGray
+    Write-Host "Stop: .\start.ps1 stop" -ForegroundColor DarkGray
 }
+
+Write-Host ""

@@ -1,4 +1,5 @@
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
 import multiprocessing
 import time
 import os
@@ -76,26 +77,33 @@ def sync_chaos_flags():
         os.remove(CHAOS_THERMAL_FLAG)
 
 
+def apply_chaos_metric_overrides(metrics: dict) -> dict:
+    """Ensure chaos-driven stress is visible even if the hardware monitor fetch fails."""
+    if cpu_spike_active():
+        metrics["cpu"] = min(98, max(metrics.get("cpu", 0), 92))
+        metrics["ram"] = min(98, max(metrics.get("ram", 0), 88))
+        metrics["temperature_c"] = min(99, max(metrics.get("temperature_c", 0), 82))
+    if thermal_spike_active():
+        metrics["temperature_c"] = min(99, max(metrics.get("temperature_c", 0), 88))
+    return metrics
+
+
 def fetch_monitor_metrics():
     """Fetch low-level metrics from the C++ or Python hardware monitor."""
+    metrics = {
+        "cpu": 0,
+        "ram": 0,
+        "temperature_c": 0,
+        "inference_latency_p99_ms": percentile(_latency_samples, 0.99),
+        "error_rate": round(_error_count / _inference_count, 4) if _inference_count else 0.0,
+        "inference_count": _inference_count,
+    }
     try:
         response = urllib.request.urlopen(f"{MONITOR_URL.rstrip('/')}/health", timeout=1)
-        metrics = json.loads(response.read().decode())
-        if cpu_spike_active():
-            metrics["cpu"] = min(98, max(metrics.get("cpu", 0), 92))
-            metrics["ram"] = min(98, max(metrics.get("ram", 0), 88))
-        if thermal_spike_active():
-            metrics["temperature_c"] = min(99, max(metrics.get("temperature_c", 0), 88))
-        return metrics
+        metrics.update(json.loads(response.read().decode()))
     except Exception:
-        return {
-            "cpu": 0,
-            "ram": 0,
-            "temperature_c": 0,
-            "inference_latency_p99_ms": percentile(_latency_samples, 0.99),
-            "error_rate": round(_error_count / _inference_count, 4) if _inference_count else 0.0,
-            "inference_count": _inference_count,
-        }
+        pass
+    return apply_chaos_metric_overrides(metrics)
 
 
 def run_task():
@@ -132,6 +140,10 @@ def send_json(handler, status, payload):
     handler.wfile.write(body)
 
 
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+
+
 class HealthCheckHandler(BaseHTTPRequestHandler):
     """HTTP handler for orchestrator health checks and job submissions"""
 
@@ -159,6 +171,14 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
 
         if self.path == "/chaos/status":
             send_json(self, 200, get_status())
+            return
+
+        if self.path == "/chaos/reset":
+            chaos = reset()
+            sync_chaos_flags()
+            if os.path.exists(JOB_FLAG):
+                os.remove(JOB_FLAG)
+            send_json(self, 200, {"status": "reset", "chaos": chaos})
             return
 
         self.send_response(404)
@@ -191,8 +211,11 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
             body = read_json_body(self)
             action = body.get("action", "reset")
             if action == "reset":
+                chaos = reset()
                 sync_chaos_flags()
-                send_json(self, 200, {"status": "reset", "chaos": reset()})
+                if os.path.exists(JOB_FLAG):
+                    os.remove(JOB_FLAG)
+                send_json(self, 200, {"status": "reset", "chaos": chaos})
                 return
 
             chaos = apply(
@@ -203,6 +226,14 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
             )
             sync_chaos_flags()
             send_json(self, 200, {"status": "applied", "chaos": chaos})
+            return
+
+        if self.path == "/chaos/reset":
+            chaos = reset()
+            sync_chaos_flags()
+            if os.path.exists(JOB_FLAG):
+                os.remove(JOB_FLAG)
+            send_json(self, 200, {"status": "reset", "chaos": chaos})
             return
 
         self.send_response(404)
@@ -243,6 +274,6 @@ def auto_register_node():
 if __name__ == "__main__":
     flush_worker_telemetry()
     multiprocessing.Process(target=auto_register_node, daemon=True).start()
-    server = HTTPServer(("0.0.0.0", NODE_PORT), HealthCheckHandler)
+    server = ThreadedHTTPServer(("0.0.0.0", NODE_PORT), HealthCheckHandler)
     print(f"[NODE] {os.environ.get('NODE_ID', 'worker')} API on port {NODE_PORT} | monitor {MONITOR_URL}")
     server.serve_forever()

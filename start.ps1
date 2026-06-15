@@ -3,11 +3,11 @@
 #   .\start.ps1 docker          # Docker dev (default)
 #   .\start.ps1 docker -Prod    # Docker production
 #   .\start.ps1 native          # No Docker — full demo locally
-#   .\start.ps1 stop            # Stop native stack
+#   .\start.ps1 restart       # Full reset (fixes offline / duplicate starts)
 
 param(
     [Parameter(Position = 0)]
-    [ValidateSet("docker", "native", "stop")]
+    [ValidateSet("docker", "native", "stop", "restart")]
     [string]$Mode = "docker",
 
     [switch]$Prod
@@ -28,5 +28,8 @@ switch ($Mode) {
     }
     "stop" {
         & (Join-Path $ScriptDir "stop-native.ps1")
+    }
+    "restart" {
+        & (Join-Path $ScriptDir "reset-cluster.ps1")
     }
 }

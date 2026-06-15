@@ -7,6 +7,7 @@ import os
 import random
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
 
 from paths import (
     CHAOS_CPU_FLAG,
@@ -65,6 +66,10 @@ def get_metrics():
     }
 
 
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+
+
 class MonitorHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
@@ -85,6 +90,6 @@ class MonitorHandler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     os.makedirs(WORKER_DIR, exist_ok=True)
-    server = HTTPServer(("0.0.0.0", MONITOR_PORT), MonitorHandler)
+    server = ThreadedHTTPServer(("0.0.0.0", MONITOR_PORT), MonitorHandler)
     print(f"[MONITOR-MOCK] {NODE_ID} on port {MONITOR_PORT} | data: {WORKER_DIR}")
     server.serve_forever()

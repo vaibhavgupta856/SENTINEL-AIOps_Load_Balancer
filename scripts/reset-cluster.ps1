@@ -9,10 +9,7 @@ Write-Host ""
 Write-Host "=== Sentinel cluster reset ===" -ForegroundColor Cyan
 Write-Host ""
 
-& (Join-Path $Root "scripts\stop-native.ps1")
-
-Write-Host "Stopping Docker stack..." -ForegroundColor Yellow
-docker compose down
+& (Join-Path $Root "scripts\cleanup-sentinel.ps1")
 
 $Registry = Join-Path $Root "orchestrator\node_registry.json"
 if (Test-Path $Registry) {

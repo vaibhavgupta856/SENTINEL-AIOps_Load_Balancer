@@ -37,9 +37,7 @@ string getMetrics(int port) {
     int tempC = 32 + (cpuLoad * 48 / 100) + node_temp_bias + (rand() % 4);
     
     // Check for load flag (Triggered by Orchestrator for stress testing)
-    char fileName[50];
-    snprintf(fileName, sizeof(fileName), "/tmp/job_%d.flag", port);
-    ifstream file(fileName);
+    ifstream file("/tmp/job_active.flag");
     if (file.good()) {
         cpuLoad = min(98, 85 + (rand() % 13));
         tempC = min(96, 72 + (rand() % 18));

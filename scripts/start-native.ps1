@@ -39,6 +39,8 @@ Write-Host ""
 Write-Host "=== Sentinel AIOps - Native mode (no Docker) ===" -ForegroundColor Cyan
 Write-Host ""
 
+& (Join-Path $Root "scripts\cleanup-sentinel.ps1")
+
 Require-Command python
 
 $npmCmdObj = Get-Command npm.cmd -ErrorAction SilentlyContinue
@@ -50,8 +52,7 @@ if ($npmCmdObj) {
 }
 
 if (Test-Path $PidFile) {
-    Write-Host "Native stack may already be running. Run .\scripts\stop-native.ps1 first." -ForegroundColor Yellow
-    exit 1
+    Remove-Item $PidFile -Force
 }
 
 New-Item -ItemType Directory -Force -Path $RuntimeDir | Out-Null
