@@ -1,6 +1,7 @@
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 import multiprocessing
+import threading
 import time
 import os
 import json
@@ -16,6 +17,7 @@ from chaos_state import (
     health_delay_seconds,
     cpu_spike_active,
     thermal_spike_active,
+    register_post_reset_hook,
 )
 from paths import (
     TELEMETRY_FILE,
@@ -30,10 +32,15 @@ from paths import (
 )
 
 LATENCY_WINDOW = 100
+MAX_CONCURRENT_TASKS = 3
+MONITOR_CACHE_TTL = 0.3
 
 _latency_samples = deque(maxlen=LATENCY_WINDOW)
 _error_count = 0
 _inference_count = 0
+_task_slots = threading.BoundedSemaphore(MAX_CONCURRENT_TASKS)
+_monitor_lock = threading.Lock()
+_monitor_cache = {"data": None, "ts": 0.0}
 
 
 def percentile(values, pct):
@@ -77,6 +84,28 @@ def sync_chaos_flags():
         os.remove(CHAOS_THERMAL_FLAG)
 
 
+def clear_workload_flags():
+    """Remove simulated load markers so metrics normalize after reset or expire."""
+    for path in (JOB_FLAG, CHAOS_CPU_FLAG, CHAOS_THERMAL_FLAG):
+        if os.path.exists(path):
+            os.remove(path)
+
+
+def invalidate_monitor_cache():
+    with _monitor_lock:
+        _monitor_cache["data"] = None
+        _monitor_cache["ts"] = 0.0
+
+
+def full_chaos_reset():
+    return reset()
+
+
+register_post_reset_hook(sync_chaos_flags)
+register_post_reset_hook(clear_workload_flags)
+register_post_reset_hook(invalidate_monitor_cache)
+
+
 def apply_chaos_metric_overrides(metrics: dict) -> dict:
     """Ensure chaos-driven stress is visible even if the hardware monitor fetch fails."""
     if cpu_spike_active():
@@ -98,11 +127,23 @@ def fetch_monitor_metrics():
         "error_rate": round(_error_count / _inference_count, 4) if _inference_count else 0.0,
         "inference_count": _inference_count,
     }
-    try:
-        response = urllib.request.urlopen(f"{MONITOR_URL.rstrip('/')}/health", timeout=1)
-        metrics.update(json.loads(response.read().decode()))
-    except Exception:
-        pass
+    now = time.time()
+    with _monitor_lock:
+        cached = _monitor_cache["data"]
+        if cached is not None and (now - _monitor_cache["ts"]) < MONITOR_CACHE_TTL:
+            metrics.update(cached)
+        else:
+            try:
+                response = urllib.request.urlopen(
+                    f"{MONITOR_URL.rstrip('/')}/health", timeout=0.8
+                )
+                data = json.loads(response.read().decode())
+                _monitor_cache["data"] = data
+                _monitor_cache["ts"] = now
+                metrics.update(data)
+            except Exception:
+                if cached is not None:
+                    metrics.update(cached)
     return apply_chaos_metric_overrides(metrics)
 
 
@@ -122,6 +163,14 @@ def run_task():
     finally:
         latency_ms = (time.time() - started) * 1000
         record_inference(latency_ms, success=success)
+        _task_slots.release()
+
+
+def start_task_worker():
+    if not _task_slots.acquire(blocking=False):
+        return False
+    threading.Thread(target=run_task, daemon=True).start()
+    return True
 
 
 def read_json_body(handler):
@@ -174,11 +223,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/chaos/reset":
-            chaos = reset()
-            sync_chaos_flags()
-            if os.path.exists(JOB_FLAG):
-                os.remove(JOB_FLAG)
-            send_json(self, 200, {"status": "reset", "chaos": chaos})
+            send_json(self, 200, {"status": "reset", "chaos": full_chaos_reset()})
             return
 
         self.send_response(404)
@@ -199,7 +244,15 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                 })
                 return
 
-            multiprocessing.Process(target=run_task).start()
+            if not start_task_worker():
+                record_inference(1200, success=False)
+                send_json(self, 503, {
+                    "status": "rejected",
+                    "job_id": job.get("job_id", "unknown"),
+                    "message": "Node at capacity",
+                })
+                return
+
             send_json(self, 200, {
                 "status": "accepted",
                 "job_id": job.get("job_id", "unknown"),
@@ -211,11 +264,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
             body = read_json_body(self)
             action = body.get("action", "reset")
             if action == "reset":
-                chaos = reset()
-                sync_chaos_flags()
-                if os.path.exists(JOB_FLAG):
-                    os.remove(JOB_FLAG)
-                send_json(self, 200, {"status": "reset", "chaos": chaos})
+                send_json(self, 200, {"status": "reset", "chaos": full_chaos_reset()})
                 return
 
             chaos = apply(
@@ -229,11 +278,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/chaos/reset":
-            chaos = reset()
-            sync_chaos_flags()
-            if os.path.exists(JOB_FLAG):
-                os.remove(JOB_FLAG)
-            send_json(self, 200, {"status": "reset", "chaos": chaos})
+            send_json(self, 200, {"status": "reset", "chaos": full_chaos_reset()})
             return
 
         self.send_response(404)

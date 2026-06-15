@@ -1,6 +1,25 @@
 # Sentinel AIOps Load Balancer
 
+> **Tagline:** *Route before the crash. Recover after the hit.*
+
 **Version 2.2** — Thermal-aware orchestration with cooling-off routing, chaos testing, and self-healing recovery.
+
+---
+
+### This is not a simulator
+
+**Sentinel runs real workloads on real worker processes.** When you submit a job, it is actually executed on a live node. When you trigger chaos — CPU overload, thermal spike, packet drop, or node kill — the worker **genuinely fails, goes offline, or stops accepting traffic**. When you click **Recover**, the orchestrator **actually clears fault state, resets circuit breakers, and brings the node back into the routing pool** — or tells you exactly why it could not.
+
+Nothing here is cosmetic dashboard theater:
+
+- **Real inference jobs** are routed, executed, logged, and rerouted on failure
+- **Real telemetry** is polled from C++ hardware monitors and Python worker APIs every 3 seconds
+- **Real crashes and isolation** happen — circuit breakers open, routing weight drops, traffic shifts to healthy nodes
+- **Real recovery** is attempted against live workers — chaos flags cleared, health re-probed, traffic restored
+
+You are operating a working AIOps load balancer with a live cluster, not watching a pre-recorded demo.
+
+---
 
 Sentinel is an AIOps load-balancing platform that distributes inference jobs across a cluster of C++ worker nodes. Unlike basic round-robin or CPU-only balancers, it watches **die temperature**, **inference latency (p99)**, and **error rates**, then throttles traffic to stressed nodes before they crash.
 

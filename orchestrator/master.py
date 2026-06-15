@@ -408,10 +408,10 @@ def track_state_transition(node_id: str, status: str, circuit: str):
 
     node_previous_state[node_id] = {'status': status, 'circuit': circuit}
 
-async def probe_worker_health(client: httpx.AsyncClient, url: str) -> dict:
+async def probe_worker_health(client: httpx.AsyncClient, url: str, timeout: float = 5.0) -> dict:
     """Lightweight health probe used to diagnose why recovery failed."""
     try:
-        resp = await client.get(f"{url}/health", timeout=2.0)
+        resp = await client.get(f"{url}/health", timeout=timeout)
         if resp.status_code == 200:
             return {"ok": True}
         return {
@@ -424,7 +424,7 @@ async def probe_worker_health(client: httpx.AsyncClient, url: str) -> dict:
         return {
             "ok": False,
             "reason": "health_timeout",
-            "detail": "health check timed out after 2 seconds",
+            "detail": "health check timed out after 5 seconds",
         }
     except httpx.ConnectError:
         return {
@@ -443,7 +443,7 @@ def _classify_chaos_reset_error(exc: Exception) -> dict:
     if isinstance(exc, httpx.TimeoutException):
         return {
             "reason": "chaos_reset_timeout",
-            "detail": "chaos reset timed out after 8 seconds — worker may be hung",
+            "detail": "chaos reset timed out after 10 seconds — worker may be hung",
         }
     if isinstance(exc, httpx.ConnectError):
         return {
@@ -493,7 +493,7 @@ def build_recovery_failure_message(
     if health_reason == "health_timeout":
         return health_reason, (
             f"{node_id} could not be recovered. Chaos was cleared, but the health check still "
-            f"timed out after 2 seconds — the worker is overloaded or stuck and needs a container restart."
+            f"timed out after 5 seconds — the worker is overloaded or stuck. Wait a few seconds and try Recover again."
         )
     if health_reason == "health_rejected":
         status_code = health_probe.get("status_code", "?")
@@ -529,28 +529,33 @@ async def recover_node(client: httpx.AsyncClient, node_id: str) -> dict:
     async def reset_worker_chaos(target_url: str) -> tuple[bool, Optional[dict]]:
         cleared = False
         error = None
-        for reset_path in ("/chaos/reset", "/chaos"):
+        reset_attempts = (
+            ("GET", f"{target_url}/chaos/reset", None),
+            ("POST", f"{target_url}/chaos/reset", None),
+            ("POST", f"{target_url}/chaos", {"action": "reset"}),
+        )
+        for method, reset_url, payload in reset_attempts:
             try:
-                if reset_path == "/chaos/reset":
-                    resp = await client.post(f"{target_url}{reset_path}", timeout=8.0)
+                if method == "GET":
+                    resp = await client.get(reset_url, timeout=10.0)
                 else:
                     resp = await client.post(
-                        f"{target_url}{reset_path}",
-                        json={"action": "reset"},
-                        timeout=8.0,
+                        reset_url,
+                        json=payload,
+                        timeout=10.0,
                     )
                 if resp.status_code == 200:
                     node["chaos"] = None
                     cleared = True
+                    error = None
                     break
-                if reset_path == "/chaos":
-                    error = {
-                        "reason": "chaos_reset_rejected",
-                        "detail": f"worker returned HTTP {resp.status_code}",
-                    }
+                error = {
+                    "reason": "chaos_reset_rejected",
+                    "detail": f"worker returned HTTP {resp.status_code}",
+                }
             except Exception as e:
                 error = _classify_chaos_reset_error(e)
-                logger.warning(f"Chaos reset failed for {node_id} at {target_url}{reset_path}: {e}")
+                logger.warning(f"Chaos reset failed for {node_id} at {reset_url}: {e}")
         return cleared, error
 
     chaos_cleared, chaos_error = await reset_worker_chaos(url)
@@ -563,14 +568,15 @@ async def recover_node(client: httpx.AsyncClient, node_id: str) -> dict:
 
     poll = None
     online = False
-    for _ in range(4):
-        poll = await fetch_and_save(client, node_id)
+    health_timeout = 5.0 if in_recovery_grace(node_id) else 3.0
+    for attempt in range(8):
+        poll = await fetch_and_save(client, node_id, health_timeout=health_timeout)
         online = poll is not None and poll.get("status") == "Online"
         if online:
             break
         if not chaos_cleared:
             chaos_cleared, chaos_error = await reset_worker_chaos(url)
-        await asyncio.sleep(0.4)
+        await asyncio.sleep(0.5)
 
     if online:
         return {
@@ -591,8 +597,8 @@ async def recover_node(client: httpx.AsyncClient, node_id: str) -> dict:
     }):
         url = resolve_worker_url(node_id)
         chaos_cleared, chaos_error = await reset_worker_chaos(url)
-        for _ in range(4):
-            poll = await fetch_and_save(client, node_id)
+        for _ in range(8):
+            poll = await fetch_and_save(client, node_id, health_timeout=5.0)
             online = poll is not None and poll.get("status") == "Online"
             if online:
                 return {
@@ -607,7 +613,7 @@ async def recover_node(client: httpx.AsyncClient, node_id: str) -> dict:
                     ),
                     "recoverable": True,
                 }
-            await asyncio.sleep(0.4)
+            await asyncio.sleep(0.5)
         health_probe = await probe_worker_health(client, url)
 
     failure_reason, message = build_recovery_failure_message(
@@ -633,7 +639,7 @@ async def recover_node(client: httpx.AsyncClient, node_id: str) -> dict:
         },
     }
 
-async def fetch_and_save(client, node_id: str):
+async def fetch_and_save(client, node_id: str, health_timeout: float = 3.0):
     node = node_registry.nodes.get(node_id)
     if not node:
         return None
@@ -641,7 +647,7 @@ async def fetch_and_save(client, node_id: str):
     url = resolve_worker_url(node_id)
 
     try:
-        resp = await client.get(f"{url}/health", timeout=2.0)
+        resp = await client.get(f"{url}/health", timeout=health_timeout)
         if resp.status_code != 200:
             raise httpx.HTTPStatusError("unhealthy", request=resp.request, response=resp)
 

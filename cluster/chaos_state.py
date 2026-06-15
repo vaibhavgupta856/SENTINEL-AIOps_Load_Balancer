@@ -12,17 +12,41 @@ _chaos = {
     "active_action": None,
 }
 _lock = threading.Lock()
+_post_reset_hooks = []
+
+
+def register_post_reset_hook(fn):
+    """Register cleanup (e.g. remove flag files) after chaos reset or auto-expire."""
+    _post_reset_hooks.append(fn)
+
+
+def _run_post_reset_hooks():
+    for hook in _post_reset_hooks:
+        try:
+            hook()
+        except Exception:
+            pass
+
+
+def _expire_if_needed_unlocked() -> bool:
+    if _chaos["expires_at"] and time.time() > _chaos["expires_at"]:
+        reset_unlocked()
+        return True
+    return False
 
 
 def _expire_if_needed():
-    if _chaos["expires_at"] and time.time() > _chaos["expires_at"]:
-        reset()
+    expired = False
+    with _lock:
+        expired = _expire_if_needed_unlocked()
+    if expired:
+        _run_post_reset_hooks()
 
 
 def get_status():
     with _lock:
-        _expire_if_needed()
-        return {
+        expired = _expire_if_needed_unlocked()
+        status = {
             "active": bool(_chaos["active_action"]),
             "action": _chaos["active_action"],
             "latency_ms": _chaos["latency_ms"],
@@ -32,6 +56,9 @@ def get_status():
             "thermal_spike": _chaos["thermal_spike"],
             "expires_at": _chaos["expires_at"] or None,
         }
+    if expired:
+        _run_post_reset_hooks()
+    return status
 
 
 def apply(action, duration=30, latency_ms=3000, drop_rate=80):
@@ -67,32 +94,46 @@ def reset_unlocked():
 def reset():
     with _lock:
         reset_unlocked()
+    _run_post_reset_hooks()
     return get_status()
 
 
 def should_drop_health():
     with _lock:
-        _expire_if_needed()
+        expired = _expire_if_needed_unlocked()
         if _chaos["killed"]:
-            return True
-        if _chaos["drop_rate"] > 0:
-            return random.randint(1, 100) <= _chaos["drop_rate"]
-        return False
+            result = True
+        elif _chaos["drop_rate"] > 0:
+            result = random.randint(1, 100) <= _chaos["drop_rate"]
+        else:
+            result = False
+    if expired:
+        _run_post_reset_hooks()
+    return result
 
 
 def health_delay_seconds():
     with _lock:
-        _expire_if_needed()
-        return _chaos["latency_ms"] / 1000.0
+        expired = _expire_if_needed_unlocked()
+        delay = _chaos["latency_ms"] / 1000.0
+    if expired:
+        _run_post_reset_hooks()
+    return delay
 
 
 def cpu_spike_active():
     with _lock:
-        _expire_if_needed()
-        return _chaos["cpu_spike"]
+        expired = _expire_if_needed_unlocked()
+        active = _chaos["cpu_spike"]
+    if expired:
+        _run_post_reset_hooks()
+    return active
 
 
 def thermal_spike_active():
     with _lock:
-        _expire_if_needed()
-        return _chaos["thermal_spike"]
+        expired = _expire_if_needed_unlocked()
+        active = _chaos["thermal_spike"]
+    if expired:
+        _run_post_reset_hooks()
+    return active
