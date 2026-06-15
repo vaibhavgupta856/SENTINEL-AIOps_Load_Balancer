@@ -10,7 +10,9 @@
 
 ---
 
-<p><strong><em>Sentinel runs real workloads on real worker processes.</em></strong> When you submit a job, it is <strong>actually executed</strong> on a live node. When you trigger chaos — CPU overload, thermal spike, packet drop, or node kill — the worker <strong>genuinely fails, goes offline, or stops accepting traffic</strong>. When you click <strong>Recover</strong>, the orchestrator <strong>actually clears fault state, resets circuit breakers, and brings the node back into the routing pool</strong> — or tells you exactly why it could not.</p>
+<h4 align="center">
+<strong>Sentinel runs real workloads on real worker processes.</strong> When you submit a job, it is <strong>actually executed</strong> on a live node. When you trigger chaos — CPU overload, thermal spike, packet drop, or node kill — the worker <strong>genuinely fails, goes offline, or stops accepting traffic</strong>. When you click <strong>Recover</strong>, the orchestrator <strong>actually clears fault state, resets circuit breakers, and brings the node back into the routing pool</strong> — or tells you exactly why it could not.
+</h4>
 
 **Nothing here is cosmetic dashboard theater:**
 
