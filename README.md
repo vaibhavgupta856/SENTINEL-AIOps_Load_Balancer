@@ -1,5 +1,15 @@
 # Sentinel AIOps Load Balancer
 
+## Demo video
+
+<p align="center">
+  <a href="https://youtu.be/ipE_n7BX8yw">
+    <img src="https://img.youtube.com/vi/ipE_n7BX8yw/hqdefault.jpg" alt="Sentinel AIOps demo video" width="600">
+  </a>
+</p>
+
+<p align="center"><strong>▶ <a href="https://youtu.be/ipE_n7BX8yw">Watch the demo video on YouTube</a></strong></p>
+
 <h1 align="center"><strong>⚠️ THIS IS NOT A SIMULATOR ⚠️</strong></h1>
 
 <p align="center"><strong>Real jobs. Real failures. Real recovery.</strong></p>
@@ -31,6 +41,7 @@ Sentinel is an AIOps load-balancing platform that distributes inference jobs acr
 
 ## Table of contents
 
+- [Demo video](#demo-video)
 - [What problem does it solve?](#what-problem-does-it-solve)
 - [How it works](#how-it-works)
 - [Architecture](#architecture)
